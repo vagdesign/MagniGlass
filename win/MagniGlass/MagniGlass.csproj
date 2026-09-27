@@ -14,7 +14,7 @@
     <Authors>Vangelis Makridakis; Claude (Anthropic)</Authors>
     <Copyright>© 2026 Ax-Easy - Vangelis Makridakis</Copyright>
     <Description>Realistic magnifying glass that follows the mouse</Description>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <ApplicationIcon>MagniGlass.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
@@ -23,6 +23,12 @@
     <LensCoreDir>$(MSBuildThisFileDirectory)..\..\core\</LensCoreDir>
     <LensDll>$(IntermediateOutputPath)lenscore.dll</LensDll>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DirectX bindings for the DirectComposition output (the glass window). -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DirectComposition" Version="3.8.3" />
+  </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="MagniGlass.ico" LogicalName="MagniGlass.ico" />

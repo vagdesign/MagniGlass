@@ -10,6 +10,8 @@ internal static class NativeMethods
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int WS_EX_TOPMOST = 0x00000008;
     public const int WS_EX_NOACTIVATE = 0x08000000;
+    public const int WS_EX_NOREDIRECTIONBITMAP = 0x00200000;
+    public const uint LWA_ALPHA = 2;
 
     public const int WM_NCHITTEST = 0x0084;
     public const int WM_HOTKEY = 0x0312;
@@ -20,7 +22,7 @@ internal static class NativeMethods
 
     public const int SW_HIDE = 0;
     public const int SW_SHOWNOACTIVATE = 4;
-    public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
     public static readonly IntPtr HWND_TOPMOST = new(-1);
 
     public const int ULW_ALPHA = 2;
@@ -105,6 +107,7 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hWnd, int crKey, byte alpha, uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);

@@ -8,7 +8,10 @@ namespace MagniGlass;
 /// The glass: a click-through, per-pixel-alpha layered window that follows the pointer.
 /// It lives on its own thread, paced by the compositor (DwmFlush): each frame copies the
 /// screen around the pointer, runs it through the lens and puts the window on the pointer.
-/// The window is excluded from screen capture, so it never magnifies itself. Windows only
+/// The window is excluded from screen capture, so it never magnifies itself. Windows refuses
+/// that for windows drawn with UpdateLayeredWindow, so the glass is drawn through
+/// DirectComposition (<see cref="CompositionOutput"/>); UpdateLayeredWindow is only the
+/// fallback when DirectComposition cannot start. Windows only
 /// honours that for a window that is already shown, and a hide/show cycle can drop it, so
 /// the window is shown once and then kept on screen (fully transparent while "hidden").
 /// Each frame also checks that the capture does not contain our own previous frame; if it
@@ -26,6 +29,8 @@ internal sealed class Magnifier : IDisposable
     // Render-thread state
     private IntPtr _hwnd;
     private WndProc? _wndProc;
+    private CompositionOutput? _comp;
+    private int _winX = int.MinValue, _winY, _winW, _winH;
     private bool _shown, _blank, _affinitySet, _useCaptureBlt;
     private int _feedbackFrames;
     private bool _warned;
@@ -102,9 +107,9 @@ internal sealed class Magnifier : IDisposable
                     Log.Error("Render", ex);
                     _visible = false;
                 }
-                // Wait for the next composition (vsync). If DWM returns at once (it can,
-                // e.g. while the display sleeps), fall back to ~120 fps.
-                DwmFlush();
+                // Wait for the next composition (vsync); Present(1) already did with DirectComposition.
+                // If that returns at once (it can, e.g. while the display sleeps), fall back to ~120 fps.
+                if (_comp == null) DwmFlush();
                 if (Stopwatch.GetElapsedTime(t0).TotalMilliseconds < 4) Thread.Sleep(4);
             }
         }
@@ -112,6 +117,7 @@ internal sealed class Magnifier : IDisposable
         finally
         {
             FreeBuffers();
+            _comp?.Dispose();
             if (_hwnd != IntPtr.Zero) DestroyWindow(_hwnd);
         }
     }
@@ -127,10 +133,41 @@ internal sealed class Magnifier : IDisposable
             lpszClassName = "MagniGlassLens",
         };
         RegisterClassEx(ref wc);
-        _hwnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            "MagniGlassLens", "MagniGlass", WS_POPUP, 0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        const int baseStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+
+        // Preferred: DirectComposition content in a click-through window. The window is layered
+        // only for click-through (constant alpha 255 via SetLayeredWindowAttributes, which does
+        // allow capture exclusion); the pixels come from the composition swap chain.
+        _hwnd = CreateWindowEx(baseStyle | WS_EX_NOREDIRECTIONBITMAP, "MagniGlassLens", "MagniGlass", WS_POPUP,
+            0, 0, 8, 8, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
         if (_hwnd == IntPtr.Zero) throw new InvalidOperationException("CreateWindowEx failed: " + Marshal.GetLastWin32Error());
-        Log.Info($"Lens window created ({Environment.OSVersion.VersionString})");
+        try
+        {
+            SetLayeredWindowAttributes(_hwnd, 0, 255, LWA_ALPHA);
+            _comp = new CompositionOutput(_hwnd, 8, 8);
+            Log.Info($"Lens window created with DirectComposition ({Environment.OSVersion.VersionString})");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("DirectComposition unavailable, using UpdateLayeredWindow", ex);
+            _comp?.Dispose();
+            _comp = null;
+            DestroyWindow(_hwnd);
+        }
+
+        _hwnd = CreateWindowEx(baseStyle, "MagniGlassLens", "MagniGlass", WS_POPUP,
+            0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        if (_hwnd == IntPtr.Zero) throw new InvalidOperationException("CreateWindowEx failed: " + Marshal.GetLastWin32Error());
+        Log.Info($"Lens window created with UpdateLayeredWindow ({Environment.OSVersion.VersionString})");
+    }
+
+    /// <summary>Moves / sizes the DirectComposition window (only when something changed).</summary>
+    private void PlaceWindow(int x, int y, int w, int h)
+    {
+        if (x == _winX && y == _winY && w == _winW && h == _winH) return;
+        SetWindowPos(_hwnd, IntPtr.Zero, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        _winX = x; _winY = y; _winW = w; _winH = h;
     }
 
     /// <summary>
@@ -146,12 +183,19 @@ internal sealed class Magnifier : IDisposable
         bool read = GetWindowDisplayAffinity(_hwnd, out now);
         _affinitySet = ok && read && now == WDA_EXCLUDEFROMCAPTURE;
         _useCaptureBlt = _affinitySet;
-        Log.Info($"Exclude from capture: set={ok} (error {err}), reads back 0x{now:X} -> {(_affinitySet ? "on" : "off, plain BitBlt")}");
+        Log.Info($"Exclude from capture ({(_comp != null ? "DirectComposition" : "UpdateLayeredWindow")}): set={ok} (error {err}), reads back 0x{now:X} -> {(_affinitySet ? "on" : "off, plain BitBlt")}");
     }
 
     /// <summary>"Hidden": a fully transparent 1x1 frame. The window stays shown so its capture exclusion holds.</summary>
     private void Blank()
     {
+        if (_comp != null)
+        {
+            _comp.PresentClear();
+            _blank = true;
+            _lastValid = false;
+            return;
+        }
         using var dib = new Dib(1, 1); // zeroed: transparent
         IntPtr screen = GetDC(IntPtr.Zero);
         try
@@ -247,10 +291,19 @@ internal sealed class Magnifier : IDisposable
             lens.DrawGlass(_source.Bits, size, size, _sourceSize * 4, radius, radius, frame.Bits, frame.Width * 4);
 
             var dst = new POINT(pt.X - lens.CenterX, pt.Y - lens.CenterY);
-            var sz = new SIZE(frame.Width, frame.Height);
-            var src = new POINT(0, 0);
-            var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
-            UpdateLayeredWindow(_hwnd, screen, ref dst, ref sz, frame.Dc, ref src, 0, ref blend, ULW_ALPHA);
+            if (_comp != null)
+            {
+                _comp.Resize(frame.Width, frame.Height);
+                PlaceWindow(dst.X, dst.Y, frame.Width, frame.Height);
+                _comp.Present(frame.Bits, frame.Width * 4);
+            }
+            else
+            {
+                var sz = new SIZE(frame.Width, frame.Height);
+                var src = new POINT(0, 0);
+                var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
+                UpdateLayeredWindow(_hwnd, screen, ref dst, ref sz, frame.Dc, ref src, 0, ref blend, ULW_ALPHA);
+            }
             _blank = false;
             _lastPt = pt;
             _lastValid = true;
