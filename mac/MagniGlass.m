@@ -125,6 +125,57 @@ static void DrawGlass(LensCtx *lens, int diameter, const uint8_t *src, int w, in
 }
 
 // ---------------------------------------------------------------------------------------
+#pragma mark - Updates (GitHub Releases, as in RailSaver)
+
+static NSString *const kFeedRepo = @"vagdesign/MagniGlass";
+
+static NSString *AppVersion(void) {
+    return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.0.0";
+}
+
+/// YES if version a (x.y.z) is newer than b.
+static BOOL VersionNewer(NSString *a, NSString *b) {
+    NSArray<NSString *> *pa = [a componentsSeparatedByString:@"."], *pb = [b componentsSeparatedByString:@"."];
+    for (NSUInteger i = 0; i < 3; i++) {
+        NSInteger x = i < pa.count ? pa[i].integerValue : 0, y = i < pb.count ? pb[i].integerValue : 0;
+        if (x != y) return x > y;
+    }
+    return NO;
+}
+
+/// Asks GitHub for the latest release. On the main queue: latest version, the Mac zip (or the
+/// release page) to download, and an error text when the check failed.
+static void CheckForUpdate(void (^done)(NSString *latest, NSURL *download, NSString *error)) {
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://api.github.com/repos/%@/releases/latest", kFeedRepo]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:30];
+    [req setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
+    [req setValue:[NSString stringWithFormat:@"MagniGlass/%@", AppVersion()] forHTTPHeaderField:@"User-Agent"];
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+        NSString *latest = nil, *err = nil;
+        NSURL *download = nil;
+        NSInteger status = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        NSDictionary *json = data && status == 200 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([json isKindOfClass:NSDictionary.class]) {
+            NSString *tag = [json[@"tag_name"] description];
+            latest = [tag hasPrefix:@"v"] || [tag hasPrefix:@"V"] ? [tag substringFromIndex:1] : tag;
+            for (NSDictionary *a in json[@"assets"]) {
+                NSString *name = [a[@"name"] description];
+                if ([name rangeOfString:@"mac" options:NSCaseInsensitiveSearch].location != NSNotFound && [name.lowercaseString hasSuffix:@".zip"])
+                    download = [NSURL URLWithString:[a[@"browser_download_url"] description]];
+            }
+            if (!download && json[@"html_url"]) download = [NSURL URLWithString:[json[@"html_url"] description]];
+        } else {
+            err = error ? error.localizedDescription : [NSString stringWithFormat:@"GitHub answered %ld", (long)status];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ done(latest, download, err); });
+    }] resume];
+}
+
+static NSURL *ReleasesPage(void) {
+    return [NSURL URLWithString:[NSString stringWithFormat:@"https://github.com/%@/releases/latest", kFeedRepo]];
+}
+
+// ---------------------------------------------------------------------------------------
 #pragma mark - Sample page (settings preview, render test)
 
 /// A light "document" with text and colour bars, in a BGRA premultiplied bitmap context.
@@ -604,6 +655,9 @@ static CGDirectDisplayID DisplayIDOf(NSScreen *s) {
     NSButton *_wheel, *_shadow, *_login, *_permissionButton;
     NSTextField *_wheelStep;
     NSImageView *_preview;
+    NSTextField *_updStatus;
+    NSButton *_updCheck, *_updDownload;
+    NSURL *_updURL;
 }
 
 static NSTextField *Label(NSString *s) {
@@ -708,9 +762,15 @@ static NSStackView *Row(NSArray<NSView *> *views) {
     [_preview.widthAnchor constraintEqualToConstant:440].active = YES;
     [_preview.heightAnchor constraintEqualToConstant:260].active = YES;
 
-    NSTextField *version = [NSTextField labelWithString:[NSString stringWithFormat:@"MagniGlass %@",
-        [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @""]];
-    version.textColor = NSColor.tertiaryLabelColor;
+    _updStatus = [NSTextField labelWithString:@"Not checked yet."];
+    _updCheck = [NSButton buttonWithTitle:@"Check for Updates" target:self action:@selector(checkUpdates)];
+    _updDownload = [NSButton buttonWithTitle:@"Download" target:self action:@selector(downloadUpdate)];
+    _updDownload.bezelColor = NSColor.controlAccentColor;
+    _updDownload.hidden = YES;
+    NSTextField *installed = [NSTextField labelWithString:[NSString stringWithFormat:@"Installed %@ ·", AppVersion()]];
+    installed.textColor = NSColor.secondaryLabelColor;
+
+    NSView *credits = [self creditsView];
 
     NSGridView *grid = [NSGridView gridViewWithViews:@[
         @[Label(@"Shortcut:"), Row(@[_shortcut, resetKey])],
@@ -722,16 +782,19 @@ static NSStackView *Row(NSArray<NSView *> *views) {
         @[Label(@"Handle:"), Row(@[_handle, _shadow])],
         @[NSGridCell.emptyContentView, _login],
         @[Label(@"Screen access:"), Row(@[_permission, _permissionButton])],
+        @[Label(@"Updates:"), Row(@[installed, _updStatus])],
+        @[NSGridCell.emptyContentView, Row(@[_updCheck, _updDownload])],
         @[_preview, NSGridCell.emptyContentView],
-        @[version, NSGridCell.emptyContentView],
+        @[credits, NSGridCell.emptyContentView],
     ]];
     grid.rowSpacing = 10;
     grid.columnSpacing = 10;
     [grid cellForView:_preview].row.topPadding = 8;
-    [grid mergeCellsInHorizontalRange:NSMakeRange(0, 2) verticalRange:NSMakeRange(9, 1)];
-    [grid mergeCellsInHorizontalRange:NSMakeRange(0, 2) verticalRange:NSMakeRange(10, 1)];
+    [grid mergeCellsInHorizontalRange:NSMakeRange(0, 2) verticalRange:NSMakeRange(11, 1)];
+    [grid mergeCellsInHorizontalRange:NSMakeRange(0, 2) verticalRange:NSMakeRange(12, 1)];
     [grid cellForView:_preview].xPlacement = NSGridCellPlacementCenter;
-    [grid cellForView:version].xPlacement = NSGridCellPlacementTrailing;
+    [grid cellForView:credits].xPlacement = NSGridCellPlacementFill;
+    [grid cellForView:credits].row.topPadding = 6;
     [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
     for (NSInteger i = 0; i < grid.numberOfRows; i++) [grid rowAtIndex:i].yPlacement = NSGridCellPlacementCenter;
     grid.translatesAutoresizingMaskIntoConstraints = NO;
@@ -746,9 +809,71 @@ static NSStackView *Row(NSArray<NSView *> *views) {
     ]];
 }
 
+/// Credits, as in RailSaver: separator, "MagniGlass x.y.z · created by Vangelis Makridakis & Claude · by Ax-Easy", GitHub link.
+- (NSView *)creditsView {
+    NSFont *font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    NSColor *muted = NSColor.secondaryLabelColor;
+    NSMutableAttributedString *t = [[NSMutableAttributedString alloc] init];
+    void (^text)(NSString *) = ^(NSString *s) {
+        [t appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: muted}]];
+    };
+    void (^link)(NSString *, NSString *, NSColor *, BOOL) = ^(NSString *s, NSString *url, NSColor *color, BOOL bold) {
+        NSMutableDictionary *a = [@{NSFontAttributeName: bold ? [NSFont boldSystemFontOfSize:NSFont.smallSystemFontSize] : font,
+                                    NSLinkAttributeName: [NSURL URLWithString:url]} mutableCopy];
+        if (color) a[NSForegroundColorAttributeName] = color;
+        [t appendAttributedString:[[NSAttributedString alloc] initWithString:s attributes:a]];
+    };
+    text([NSString stringWithFormat:@"MagniGlass %@ · created by ", AppVersion()]);
+    link(@"Vangelis Makridakis", @"https://www.ax-easy.com", nil, NO);
+    text(@" & ");
+    link(@"Claude", @"https://claude.ai", nil, NO);
+    text(@" · by ");
+    link(@"Ax-Easy", @"https://www.ax-easy.com", [NSColor colorWithSRGBRed:1.0 green:0.55 blue:0.10 alpha:1], YES);
+    text(@"\n");
+    link([NSString stringWithFormat:@"github.com/%@", kFeedRepo], [NSString stringWithFormat:@"https://github.com/%@", kFeedRepo], nil, NO);
+
+    NSTextField *label = [NSTextField labelWithAttributedString:t];
+    label.selectable = YES;              // links are clickable
+    label.allowsEditingTextAttributes = YES;
+    NSBox *line = [[NSBox alloc] init];
+    line.boxType = NSBoxSeparator;
+    NSStackView *stack = [NSStackView stackViewWithViews:@[line, label]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8;
+    [line.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    return stack;
+}
+
+- (void)checkUpdates {
+    _updStatus.stringValue = @"Checking…";
+    _updDownload.hidden = YES;
+    _updCheck.enabled = NO;
+    CheckForUpdate(^(NSString *latest, NSURL *download, NSString *error) {
+        self->_updCheck.enabled = YES;
+        self->_updURL = download ?: ReleasesPage();
+        if (error || !latest) {
+            self->_updStatus.stringValue = [NSString stringWithFormat:@"Could not check (%@).", error ?: @"no release"];
+            self->_updDownload.title = @"Open the Releases Page";
+            self->_updDownload.hidden = NO;
+        } else if (VersionNewer(latest, AppVersion())) {
+            self->_updStatus.stringValue = [NSString stringWithFormat:@"Version %@ is available.", latest];
+            self->_updDownload.title = [NSString stringWithFormat:@"Download %@", latest];
+            self->_updDownload.hidden = NO;
+        } else {
+            self->_updStatus.stringValue = [NSString stringWithFormat:@"Up to date (latest is %@).", latest];
+        }
+    });
+}
+
+- (void)downloadUpdate {
+    [NSWorkspace.sharedWorkspace openURL:_updURL ?: ReleasesPage()];
+}
+
 - (void)show {
     if (!_window) [self build];
     [self load];
+    [self checkUpdates];
     [NSApp activateIgnoringOtherApps:YES];
     if (!_window.visible) [_window center];
     [_window makeKeyAndOrderFront:nil];
@@ -926,6 +1051,8 @@ static CGEventRef WheelTap(CGEventTapProxy proxy, CGEventType type, CGEventRef e
     id _wheelMonitor;
     BOOL _suspended;
     double _wheelAccum;
+    NSMenuItem *_updateItem;
+    NSURL *_updateURL;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -971,6 +1098,30 @@ static CGEventRef WheelTap(CGEventTapProxy proxy, CGEventType type, CGEventRef e
         [self showSettings];
         if (!CGPreflightScreenCaptureAccess()) CGRequestScreenCaptureAccess();
     }
+
+    // Updates: look a minute after launch, then every 12 hours; a newer release shows up in the menu.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [weakSelf backgroundUpdateCheck]; });
+    [NSTimer scheduledTimerWithTimeInterval:12 * 3600 repeats:YES block:^(NSTimer *t) { [weakSelf backgroundUpdateCheck]; }];
+}
+
+- (void)backgroundUpdateCheck {
+    CheckForUpdate(^(NSString *latest, NSURL *download, NSString *error) {
+        if (!latest || !VersionNewer(latest, AppVersion())) return;
+        self->_updateURL = download ?: ReleasesPage();
+        NSString *title = [NSString stringWithFormat:@"Download MagniGlass %@…", latest];
+        if (!self->_updateItem) {
+            self->_updateItem = [[NSMenuItem alloc] initWithTitle:title action:@selector(downloadUpdate) keyEquivalent:@""];
+            self->_updateItem.target = self;
+            [self->_status.menu insertItem:self->_updateItem atIndex:0];
+            [self->_status.menu insertItem:NSMenuItem.separatorItem atIndex:1];
+        }
+        self->_updateItem.title = title;
+        NSLog(@"MagniGlass: version %@ is available", latest);
+    });
+}
+
+- (void)downloadUpdate {
+    [NSWorkspace.sharedWorkspace openURL:_updateURL ?: ReleasesPage()];
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {

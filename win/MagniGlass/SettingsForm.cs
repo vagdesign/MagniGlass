@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
@@ -23,6 +24,12 @@ internal sealed class SettingsForm : Form
     private readonly ComboBox _handle = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
     private readonly CheckBox _shadow = new() { Text = "Drop shadow", AutoSize = true };
     private readonly CheckBox _startup = new() { Text = "Start MagniGlass when I sign in to Windows", AutoSize = true };
+    private readonly CheckBox _autoUpdate = new() { Text = "Install updates automatically", AutoSize = true };
+    private readonly Label _updStatus = new() { AutoSize = true, Text = "Not checked yet." };
+    private readonly Button _updCheck = new() { Text = "Check for updates", AutoSize = true };
+    private readonly Button _updInstall = new() { Text = "Install update", AutoSize = true, Visible = false };
+    private readonly Action<string, bool> _installAndExit;
+    private UpdateService.Release? _newer;
     private readonly PictureBox _preview = new() { BorderStyle = BorderStyle.FixedSingle, SizeMode = PictureBoxSizeMode.Normal };
 
     private Bitmap? _sample;
@@ -31,11 +38,12 @@ internal sealed class SettingsForm : Form
 
     private static readonly string[] Mods = { "none", "ctrl", "shift", "alt" };
 
-    public SettingsForm(Settings settings, Func<Settings, bool> apply, HotkeyWindow hotkeys)
+    public SettingsForm(Settings settings, Func<Settings, bool> apply, HotkeyWindow hotkeys, Action<string, bool> installAndExit)
     {
         _s = settings;
         _apply = apply;
         _hotkeys = hotkeys;
+        _installAndExit = installAndExit;
 
         Text = "MagniGlass Settings";
         Icon = Program.AppIcon;
@@ -93,6 +101,22 @@ internal sealed class SettingsForm : Form
         grid.Controls.Add(new Label());
         grid.Controls.Add(_startup);
 
+        Row("Updates", Flow(new Label { Text = $"Installed {Program.Version} ·", AutoSize = true }, _updStatus));
+        grid.Controls.Add(new Label());
+        grid.Controls.Add(Flow(_updCheck, _updInstall));
+        grid.Controls.Add(new Label());
+        grid.Controls.Add(_autoUpdate);
+        grid.Controls.Add(new Label());
+        grid.Controls.Add(new Label
+        {
+            Text = "Checked at most every 12 hours; installed silently when the glass is not in use. Your settings are kept.",
+            AutoSize = true,
+            ForeColor = SystemColors.GrayText,
+            MaximumSize = new Size(LogicalToDeviceUnits(360), 0),
+        });
+        _updCheck.Click += async (_, _) => await CheckUpdatesAsync();
+        _updInstall.Click += async (_, _) => await InstallUpdateAsync();
+
         _preview.Size = LogicalToDeviceUnits(new Size(440, 260));
         _preview.Margin = new Padding(0, 10, 0, 6);
         grid.Controls.Add(_preview);
@@ -106,12 +130,15 @@ internal sealed class SettingsForm : Form
         cancel.Click += (_, _) => Close();
         AcceptButton = ok;
         CancelButton = cancel;
-        var about = new Label { Text = $"MagniGlass {Program.Version}", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0, 8, 24, 0) };
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 6, 0, 0) };
-        buttons.Controls.AddRange(new Control[] { about, ok, cancel, applyBtn });
+        buttons.Controls.AddRange(new Control[] { ok, cancel, applyBtn });
         grid.Controls.Add(buttons);
         grid.SetColumnSpan(buttons, 2);
         buttons.Anchor = AnchorStyles.Right;
+
+        var credits = Credits();
+        grid.Controls.Add(credits);
+        grid.SetColumnSpan(credits, 2);
 
         Controls.Add(grid);
 
@@ -144,8 +171,122 @@ internal sealed class SettingsForm : Form
         _handle.SelectedIndex = _s.HandleLeft ? 1 : 0;
         _shadow.Checked = _s.Shadow;
         _startup.Checked = _s.StartWithWindows;
+        _autoUpdate.Checked = _s.AutoUpdate;
         _loading = false;
         RenderPreview();
+        Shown += async (_, _) => await CheckUpdatesAsync();
+    }
+
+    // ---- credits (as in RailSaver) ----
+
+    private Control Credits()
+    {
+        var box = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.TopDown,
+            AutoSize = true,
+            WrapContents = false,
+            Margin = new Padding(0, 12, 0, 0),
+            Padding = new Padding(0, 8, 0, 0),
+            Dock = DockStyle.Fill,
+        };
+        box.Paint += (_, e) => e.Graphics.DrawLine(SystemPens.ControlLight, 0, 0, box.Width, 0); // separator
+        var muted = SystemColors.GrayText;
+        Label Text(string t) => new() { Text = t, AutoSize = true, ForeColor = muted, Margin = new Padding(0) };
+        LinkLabel Link(string t, string url, Color? color = null, bool bold = false)
+        {
+            var l = new LinkLabel { Text = t, AutoSize = true, Margin = new Padding(0), LinkBehavior = LinkBehavior.HoverUnderline };
+            l.LinkColor = l.ActiveLinkColor = l.VisitedLinkColor = color ?? Color.FromArgb(26, 115, 232);
+            if (bold) l.Font = new Font(Font, FontStyle.Bold);
+            l.LinkClicked += (_, _) => Open(url);
+            return l;
+        }
+        var made = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 4) };
+        made.Controls.AddRange(new Control[]
+        {
+            Text($"MagniGlass {Program.Version} · created by "),
+            Link("Vangelis Makridakis", "https://www.ax-easy.com"),
+            Text(" & "),
+            Link("Claude", "https://claude.ai"),
+            Text(" · by "),
+            Link("Ax-Easy", "https://www.ax-easy.com", Color.FromArgb(255, 140, 26), bold: true),
+        });
+        box.Controls.Add(made);
+        box.Controls.Add(Link("github.com/vagdesign/MagniGlass", "https://github.com/" + UpdateService.FeedRepo));
+        return box;
+    }
+
+    private static void Open(string url)
+    {
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch (Exception ex) { Log.Error("Opening " + url, ex); }
+    }
+
+    // ---- updates (GitHub Releases, as in RailSaver) ----
+
+    private async Task CheckUpdatesAsync()
+    {
+        _updStatus.Text = "Checking…";
+        _updInstall.Visible = false;
+        _updCheck.Enabled = false;
+        try
+        {
+            var (latest, newer) = await UpdateService.CheckAsync();
+            _newer = newer;
+            if (newer != null)
+            {
+                _updStatus.Text = $"Version {newer.Version.ToString(3)} is available.";
+                _updInstall.Text = UpdateService.IsInstalled ? $"Install {newer.Version.ToString(3)}" : $"Download {newer.Version.ToString(3)}";
+                _updInstall.Visible = true;
+                _updInstall.Enabled = true;
+            }
+            else _updStatus.Text = $"Up to date (latest is {latest.ToString(3)}).";
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Update check", ex);
+            _newer = null;
+            _updStatus.Text = "Could not check (" + ex.Message + ").";
+            _updInstall.Text = "Open the releases page";
+            _updInstall.Visible = true;
+            _updInstall.Enabled = true;
+        }
+        finally
+        {
+            if (!IsDisposed) _updCheck.Enabled = true;
+        }
+    }
+
+    /// <summary>Download, verify, run the installer (it keeps the settings and restarts MagniGlass).</summary>
+    private async Task InstallUpdateAsync()
+    {
+        var r = _newer;
+        if (r == null || !UpdateService.IsInstalled)
+        {
+            // Portable copy, or the check failed: the download page.
+            Open(r?.PageUrl ?? $"https://github.com/{UpdateService.FeedRepo}/releases/latest");
+            return;
+        }
+        _updInstall.Enabled = false;
+        _updCheck.Enabled = false;
+        try
+        {
+            Commit(); // keep unsaved changes
+            var progress = new Progress<int>(p => { if (!IsDisposed) _updStatus.Text = $"Downloading {r.Version.ToString(3)}… {p}%"; });
+            string file = await UpdateService.DownloadAsync(r, progress);
+            _updStatus.Text = $"Installing {r.Version.ToString(3)}…";
+            await Task.Delay(500);
+            Close();
+            _installAndExit(file, true);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Installing update", ex);
+            if (IsDisposed) return;
+            _updStatus.Text = "Update failed: " + ex.Message;
+            _updInstall.Enabled = true;
+            _updCheck.Enabled = true;
+        }
     }
 
     private void ConfigureSize()
@@ -216,6 +357,7 @@ internal sealed class SettingsForm : Form
         _s.HandleLeft = _handle.SelectedIndex == 1;
         _s.Shadow = _shadow.Checked;
         _s.StartWithWindows = _startup.Checked;
+        _s.AutoUpdate = _autoUpdate.Checked;
         if (_apply(_s.Clone())) return true;
         _hotkeyNote.Text = $"{_s.HotkeyText} could not be registered (another program uses it). The old shortcut was kept.";
         _hotkeyNote.ForeColor = Color.Firebrick;

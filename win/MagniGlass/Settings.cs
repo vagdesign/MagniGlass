@@ -28,6 +28,8 @@ internal sealed class Settings
     public bool HandleLeft { get; set; }
     public bool Shadow { get; set; } = true;
     public bool StartWithWindows { get; set; } = true;
+    /// <summary>Install new releases automatically (checked at most every 12 hours).</summary>
+    public bool AutoUpdate { get; set; } = true;
     public bool FirstRun { get; set; } = true;
 
     public Settings Clone() => (Settings)MemberwiseClone();

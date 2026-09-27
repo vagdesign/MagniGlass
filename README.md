@@ -28,6 +28,7 @@ The glass is drawn with simple optics instead of a flat zoomed square:
 | **Wheel** | On / off, an optional key to hold (Ctrl, Shift, Alt / ⌃ ⌥ ⇧ ⌘) so the wheel still scrolls pages normally, and the zoom step per notch |
 | **Handle** | Grip to the lower right or lower left (left-handed), drop shadow on / off |
 | **Start at sign-in** | Start MagniGlass with Windows / open at login on Mac |
+| **Updates** | Installed version, **Check for updates** and one-click **Install** (Windows) / **Download** (Mac). Windows: *Install updates automatically* (on by default) |
 
 The settings window shows a **live preview** of the glass with your choices.
 
@@ -47,6 +48,11 @@ Portable: unzip `MagniGlass-portable-…zip` anywhere and run `MagniGlass.exe`.
 2. Allow **Screen Recording** when macOS asks (System Settings › Privacy & Security › Screen & System Audio Recording), then quit and reopen MagniGlass. It needs this to see what is under the pointer; nothing is saved or sent anywhere.
 3. Optional: allow **Accessibility** so the scroll wheel zooms *without* also scrolling the page under the glass. Without it the wheel still zooms, but the page scrolls too (or set a key to hold in Settings).
 4. MagniGlass lives in the menu bar (magnifier icon): **Show Magnifier**, **Settings…**, **Quit**. Press **⌃⌥M** anywhere.
+
+## Updates
+
+- **Windows**: MagniGlass checks this repository's Releases at most every 12 hours. With *Install updates automatically* on (default), it downloads the new setup, verifies its size and SHA-256, waits until the glass and the settings are closed and installs it silently; your settings are kept and MagniGlass starts again. You can also check any time in **Settings → Updates** and install with one click. Portable copies open the download page instead.
+- **macOS**: when a new version is out, **Download MagniGlass x.y.z…** appears at the top of the menu-bar menu, and **Settings → Updates** shows it too; replace the old MagniGlass.app with the new one.
 
 ## How it works
 

@@ -64,6 +64,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly SynchronizationContext _ui;
     private Settings _settings;
     private SettingsForm? _settingsForm;
+    private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 2 * 60 * 1000 };
+    private bool _updating;
 
     public TrayApp(EventWaitHandle showSettings, bool openSettings)
     {
@@ -109,6 +111,47 @@ internal sealed class TrayApp : ApplicationContext
             _settings.Save();
         }
         UpdateMenu();
+
+        // Automatic updates: first look 2 minutes after start, then hourly (a check runs at most every 12 hours).
+        _updateTimer.Tick += async (_, _) =>
+        {
+            _updateTimer.Interval = 60 * 60 * 1000;
+            await AutoUpdateAsync();
+        };
+        _updateTimer.Start();
+    }
+
+    /// <summary>
+    /// Checks GitHub Releases at most every 12 hours; a newer version is downloaded, verified and
+    /// installed silently once the glass and the settings are closed. MagniGlass restarts after it.
+    /// </summary>
+    private async Task AutoUpdateAsync()
+    {
+        if (_updating || !_settings.AutoUpdate || !UpdateService.IsInstalled || UpdateService.CheckedRecently) return;
+        _updating = true;
+        try
+        {
+            UpdateService.MarkChecked();
+            var (latest, newer) = await UpdateService.CheckAsync();
+            if (newer == null) { Log.Info($"Update check: up to date (latest {latest})"); return; }
+            Log.Info($"Update check: {newer.Version} available, downloading");
+            string file = await UpdateService.DownloadAsync(newer);
+            while (_magnifier.Visible || _settingsForm is { IsDisposed: false })
+                await Task.Delay(TimeSpan.FromSeconds(30));
+            if (!_settings.AutoUpdate) return;
+            Log.Info($"Installing {newer.Version}");
+            InstallAndExit(file, showProgress: false);
+        }
+        catch (Exception ex) { Log.Error("Automatic update", ex); }
+        finally { _updating = false; }
+    }
+
+    /// <summary>Runs the downloaded installer and quits (the installer starts MagniGlass again).</summary>
+    public void InstallAndExit(string installer, bool showProgress)
+    {
+        SaveZoom();
+        UpdateService.RunInstaller(installer, showProgress);
+        ExitThread();
     }
 
     private bool RegisterHotkey(bool showErrors)
@@ -177,7 +220,7 @@ internal sealed class TrayApp : ApplicationContext
         }
         var s = _settings.Clone();
         s.Zoom = Math.Round(_magnifier.Zoom, 2);
-        _settingsForm = new SettingsForm(s, ApplySettings, _hotkeys);
+        _settingsForm = new SettingsForm(s, ApplySettings, _hotkeys, InstallAndExit);
         _settingsForm.FormClosed += (_, _) => _settingsForm = null;
         _settingsForm.Show();
         _settingsForm.Activate();
@@ -219,6 +262,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (disposing)
         {
+            _updateTimer.Dispose();
             _wait.Unregister(null);
             _wheel.Dispose();
             _hotkeys.Dispose();

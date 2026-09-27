@@ -4,7 +4,7 @@
 #define AppName "MagniGlass"
 #define AppExe "MagniGlass.exe"
 #ifndef AppVersion
-  #define AppVersion "1.0.2"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\publish"
