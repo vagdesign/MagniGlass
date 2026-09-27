@@ -88,6 +88,9 @@ internal sealed class TrayApp : ApplicationContext
         };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) Toggle(); };
         _tray.MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowSettings(); };
+        _magnifier.CaptureProblem += () => _ui.Post(_ => _tray.ShowBalloonTip(10000, "MagniGlass",
+            "Windows is showing the glass to its own screen capture, so it cannot see behind itself. " +
+            "Please send %APPDATA%\\MagniGlass\\magniglass.log to the developer.", ToolTipIcon.Warning), null);
 
         _hotkeys = new HotkeyWindow(Toggle);
         RegisterHotkey(showErrors: true);

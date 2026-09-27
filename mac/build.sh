@@ -3,7 +3,7 @@
 # command line tools. Usage: mac/build.sh [version]   → out/MagniGlass.app
 set -eu
 cd "$(dirname "$0")/.."
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 APP=out/MagniGlass.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
