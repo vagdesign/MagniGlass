@@ -70,7 +70,7 @@ tools/make-icons.sh  renders the app icons with the lens renderer itself
   (`python3 test/make-screen.py screen.ppm` makes a sample screen.)
 - **Windows**: `dotnet publish win/MagniGlass/MagniGlass.csproj -c Release -r win-x64 --self-contained true -o publish` (needs the .NET 8 SDK and `clang-cl`, which ships with Visual Studio's C++ Clang tools or LLVM; it builds `lenscore.dll`). Then `ISCC installer\MagniGlass.iss` for the installer.
 - **macOS**: `mac/build.sh 1.0.0` → `out/MagniGlass.app` (universal, needs the Xcode command line tools).
-- **CI**: `.github/workflows/build.yml` builds the lens previews, the Windows installer + portable zip and the Mac app (signed and notarized when the Developer ID secrets are set). Pushing a tag `vX.Y.Z` publishes a release.
+- **CI**: `.github/workflows/build.yml` builds the lens previews, the Windows installer + portable zip and the Mac app (signed and notarized when the Developer ID secrets are set). Every push to `main` publishes the release `v<VERSION>` (the `VERSION` at the top of the workflow); bump it for a new version.
 
 ## License
 

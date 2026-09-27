@@ -208,7 +208,8 @@ jobs:
 
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Every push to main publishes (or updates) the release v$VERSION; a pushed tag vX.Y.Z publishes that version.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [core, windows, mac]
     runs-on: ubuntu-latest
     steps:
@@ -220,7 +221,8 @@ jobs:
       - name: Version
         id: ver
         run: |
-          v='${{ github.ref_name }}'; v="${v#v}"
+          v='${{ env.VERSION }}'
+          if [ '${{ github.ref_type }}' = 'tag' ]; then v='${{ github.ref_name }}'; v="${v#v}"; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           if [ '${{ needs.mac.outputs.notarized }}' = true ]; then
             note='It is signed with Developer ID and notarized by Apple, so it opens normally.'
@@ -230,7 +232,8 @@ jobs:
           echo "macnote=$note" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           name: MagniGlass ${{ steps.ver.outputs.version }}
           make_latest: true
           files: dist/*
