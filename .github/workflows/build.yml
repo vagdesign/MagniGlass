@@ -1,0 +1,242 @@
+name: MagniGlass
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VERSION: 1.0.0
+
+jobs:
+  core:
+    name: Lens renderer (build + preview renders)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (warnings are errors)
+        run: |
+          cc -O2 -std=c99 -Wall -Wextra -Werror -o preview test/preview.c core/lenscore.c -lm
+          cc -O2 -std=c99 -Wall -Wextra -Werror -o icon tools/icon.c core/lenscore.c -lm
+      - name: Render previews
+        run: |
+          pip install --quiet pillow
+          python3 test/make-screen.py screen.ppm
+          mkdir -p previews
+          ./preview screen.ppm p1.ppm 320 2.5 420 330
+          ./preview screen.ppm p2.ppm 240 4 900 300 1
+          ./preview screen.ppm p3.ppm 600 1.6 640 360
+          python3 -c "from PIL import Image; [Image.open(f'p{i}.ppm').save(f'previews/preview-{i}.png') for i in (1, 2, 3)]"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: magniglass-previews
+          path: previews/*.png
+
+  windows:
+    name: Windows app + installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = '${{ env.VERSION }}'
+          if ('${{ github.ref_type }}' -eq 'tag') { $v = '${{ github.ref_name }}'.TrimStart('v') }
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: clang-cl on PATH (builds lenscore.dll)
+        shell: pwsh
+        run: |
+          $llvm = "$env:ProgramFiles\LLVM\bin"
+          if (!(Test-Path "$llvm\clang-cl.exe")) { choco install llvm -y --no-progress | Out-Null }
+          $llvm | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Publish (self-contained, win-x64)
+        run: dotnet publish win/MagniGlass/MagniGlass.csproj -c Release -r win-x64 --self-contained true -p:Version=${{ steps.ver.outputs.version }} -o publish
+      - name: Verify output
+        shell: pwsh
+        run: |
+          foreach ($f in 'publish/MagniGlass.exe', 'publish/lenscore.dll') { if (!(Test-Path $f)) { throw "missing $f" } }
+          # lenscore.dll must not need the Visual C++ runtime (static /MT build)
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          if ($dumpbin) { & $dumpbin.FullName /dependents publish/lenscore.dll; & $dumpbin.FullName /exports publish/lenscore.dll | Select-String 'lens_' }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=..\publish" installer\MagniGlass.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path publish\* -DestinationPath "out\MagniGlass-portable-${{ steps.ver.outputs.version }}-win-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MagniGlass-${{ steps.ver.outputs.version }}-windows
+          path: out/*
+
+  mac:
+    name: macOS app
+    runs-on: macos-latest
+    outputs:
+      notarized: ${{ steps.staple.outputs.notarized || 'false' }}
+    env:
+      MACOS_SIGN_IDENTITY: "${{ vars.MACOS_SIGN_IDENTITY || 'Developer ID Application: Evangelos Makrydakis (7BMSHL4YZ6)' }}"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: ver
+        run: |
+          v='${{ env.VERSION }}'
+          if [ '${{ github.ref_type }}' = 'tag' ]; then v='${{ github.ref_name }}'; v="${v#v}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Build MagniGlass.app
+        run: mac/build.sh ${{ steps.ver.outputs.version }}
+      - name: Check bundle + render test (both architectures)
+        run: |
+          lipo -info out/MagniGlass.app/Contents/MacOS/MagniGlass
+          codesign --verify --verbose out/MagniGlass.app
+          mkdir -p out/mac-shot
+          out/MagniGlass.app/Contents/MacOS/MagniGlass --render-test out/mac-shot/render-arm64.png
+          /usr/sbin/softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          arch -x86_64 out/MagniGlass.app/Contents/MacOS/MagniGlass --render-test out/mac-shot/render-x86_64.png || echo "::warning::Intel render test skipped (no Rosetta)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: magniglass-mac-render
+          path: out/mac-shot/
+
+      # ---- Developer ID signing + notarization (skipped when the secrets are absent) ----
+      - name: Signing mode
+        id: mode
+        env:
+          HAVE_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' }}
+          HAVE_API_KEY: ${{ secrets.APPLE_API_KEY_P8_BASE64 != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' }}
+        run: |
+          if [ "$HAVE_CERT" = true ] && [ "$HAVE_API_KEY" = true ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=macOS signing::Signing secrets not available: keeping the ad-hoc signature (not notarized)."
+          fi
+      - name: Import Developer ID certificate into a temporary keychain
+        if: steps.mode.outputs.sign == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KC="$RUNNER_TEMP/magniglass-signing.keychain-db"
+          KC_PASS="$(uuidgen)"
+          echo "::add-mask::$KC_PASS"
+          echo "SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KC" -f pkcs12 -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          curl -fsSL --retry 3 https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KC" || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+      - name: Sign with Developer ID (hardened runtime, secure timestamp)
+        if: steps.mode.outputs.sign == 'true'
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$MACOS_SIGN_IDENTITY" out/MagniGlass.app
+          codesign --verify --deep --strict -vv out/MagniGlass.app
+      - name: Notarize (notarytool)
+        if: steps.mode.outputs.sign == 'true'
+        timeout-minutes: 45
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/notary"
+          KEY="$RUNNER_TEMP/notary/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$KEY"
+          ditto -c -k --keepParent out/MagniGlass.app "$RUNNER_TEMP/notary/MagniGlass-notarize.zip"
+          set +e
+          xcrun notarytool submit "$RUNNER_TEMP/notary/MagniGlass-notarize.zip" \
+            --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 40m --output-format json > "$RUNNER_TEMP/notary/result.json"
+          set -e
+          cat "$RUNNER_TEMP/notary/result.json"; echo
+          status="$(plutil -extract status raw -o - "$RUNNER_TEMP/notary/result.json" 2>/dev/null || true)"
+          if [ "$status" != "Accepted" ]; then
+            id="$(plutil -extract id raw -o - "$RUNNER_TEMP/notary/result.json" 2>/dev/null || true)"
+            [ -n "$id" ] && xcrun notarytool log "$id" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            echo "::error title=Notarization::status '${status:-unknown}' (expected Accepted)"
+            exit 1
+          fi
+      - name: Staple + Gatekeeper check
+        id: staple
+        if: steps.mode.outputs.sign == 'true'
+        run: |
+          set -euo pipefail
+          xcrun stapler staple out/MagniGlass.app
+          xcrun stapler validate out/MagniGlass.app
+          spctl -a -vv -t exec out/MagniGlass.app
+          echo "notarized=true" >> "$GITHUB_OUTPUT"
+      - name: Zip
+        run: |
+          set -euo pipefail
+          cd out
+          ditto -c -k --keepParent MagniGlass.app "MagniGlass-mac-${{ steps.ver.outputs.version }}.zip"
+          shasum -a 256 MagniGlass-mac-*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MagniGlass-${{ steps.ver.outputs.version }}-mac
+          path: out/MagniGlass-mac-*.zip
+      - name: Remove temporary keychain and API key
+        if: always()
+        run: |
+          if [ -n "${SIGN_KEYCHAIN:-}" ]; then security delete-keychain "$SIGN_KEYCHAIN" || true; fi
+          rm -rf "$RUNNER_TEMP/notary"
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [core, windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: MagniGlass-*
+          merge-multiple: true
+      - name: Version
+        id: ver
+        run: |
+          v='${{ github.ref_name }}'; v="${v#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ '${{ needs.mac.outputs.notarized }}' = true ]; then
+            note='It is signed with Developer ID and notarized by Apple, so it opens normally.'
+          else
+            note='This build is not notarized: the first time, right-click MagniGlass.app → Open (or run `xattr -dr com.apple.quarantine /Applications/MagniGlass.app`).'
+          fi
+          echo "macnote=$note" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MagniGlass ${{ steps.ver.outputs.version }}
+          make_latest: true
+          files: dist/*
+          body: |
+            **Windows 10/11 (x64):** run `MagniGlass-Setup-${{ steps.ver.outputs.version }}.exe` (per user, no administrator rights). SmartScreen may warn because the installer is not code-signed: *More info → Run anyway*.
+
+            **macOS 12.3+:** unzip `MagniGlass-mac-${{ steps.ver.outputs.version }}.zip`, move `MagniGlass.app` to Applications and open it. ${{ steps.ver.outputs.macnote }} Allow **Screen Recording** when asked (and **Accessibility** if you want the scroll wheel to zoom without also scrolling the page).
+
+            Settings (shortcut, glass size in pixels or % of the screen, magnification, wheel) are in the tray / menu bar icon. Default shortcut: **Ctrl + Alt + M** (Windows) / **⌃⌥M** (Mac). Scroll the mouse wheel to zoom while the glass is shown.

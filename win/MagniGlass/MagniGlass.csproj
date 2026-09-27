@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>MagniGlass</AssemblyName>
+    <RootNamespace>MagniGlass</RootNamespace>
+    <Product>MagniGlass</Product>
+    <Company>Ax-Easy</Company>
+    <Authors>Vangelis Makridakis; Claude (Anthropic)</Authors>
+    <Copyright>© 2026 Ax-Easy - Vangelis Makridakis</Copyright>
+    <Description>Realistic magnifying glass that follows the mouse</Description>
+    <Version>1.0.0</Version>
+    <ApplicationIcon>MagniGlass.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <LensCoreDir>$(MSBuildThisFileDirectory)..\..\core\</LensCoreDir>
+    <LensDll>$(IntermediateOutputPath)lenscore.dll</LensDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="MagniGlass.ico" LogicalName="MagniGlass.ico" />
+  </ItemGroup>
+
+  <!-- The lens renderer is shared C code (core/lenscore.c, also used by the Mac app).
+       Build it as lenscore.dll with clang-cl (ships with Visual Studio and on GitHub's
+       Windows runners), statically linked to the C runtime so nothing else is needed. -->
+  <Target Name="BuildLensCore" BeforeTargets="AssignTargetPaths" Inputs="$(LensCoreDir)lenscore.c;$(LensCoreDir)lenscore.h" Outputs="$(LensDll)" Condition="'$(OS)' == 'Windows_NT'">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Exec Command="clang-cl /nologo /O2 /MT /LD /DNDEBUG &quot;$(LensCoreDir)lenscore.c&quot; /Fe&quot;$(LensDll)&quot; /Fo&quot;$(IntermediateOutputPath)lenscore.obj&quot;" />
+  </Target>
+
+  <Target Name="IncludeLensCore" AfterTargets="BuildLensCore" BeforeTargets="AssignTargetPaths" Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <None Include="$(LensDll)" Link="lenscore.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+</Project>

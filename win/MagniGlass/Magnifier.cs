@@ -1,0 +1,210 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using static MagniGlass.NativeMethods;
+
+namespace MagniGlass;
+
+/// <summary>
+/// The glass: a click-through, per-pixel-alpha layered window that follows the pointer.
+/// It lives on its own thread, paced by the compositor (DwmFlush): each frame copies the
+/// screen around the pointer, runs it through the lens and puts the window on the pointer.
+/// The window is excluded from screen capture, so it never magnifies itself.
+/// </summary>
+internal sealed class Magnifier : IDisposable
+{
+    private readonly Thread _thread;
+    private readonly AutoResetEvent _wake = new(false);
+    private volatile bool _visible, _quit;
+    private volatile float _zoom;
+    private volatile Settings _settings;
+    private volatile bool _settingsChanged = true;
+
+    // Render-thread state
+    private IntPtr _hwnd;
+    private WndProc? _wndProc;
+    private bool _shown, _excluded;
+    private LensCore? _lens;
+    private Dib? _frame, _source;
+    private int _sourceSize;
+    private long _lastTopmost;
+
+    public Magnifier(Settings settings)
+    {
+        _settings = settings;
+        _zoom = (float)settings.Zoom;
+        _thread = new Thread(Run) { IsBackground = true, Name = "MagniGlass lens", Priority = ThreadPriority.AboveNormal };
+        _thread.Start();
+    }
+
+    public bool Visible
+    {
+        get => _visible;
+        set
+        {
+            _visible = value;
+            _wake.Set();
+        }
+    }
+
+    public float Zoom
+    {
+        get => _zoom;
+        set => _zoom = Math.Clamp(value, (float)Settings.MinZoom, (float)Settings.MaxZoom);
+    }
+
+    public void Apply(Settings settings)
+    {
+        _settings = settings;
+        _zoom = (float)settings.Zoom;
+        _settingsChanged = true;
+        _wake.Set();
+    }
+
+    private void Run()
+    {
+        try
+        {
+            CreateWindow();
+            var handles = new[] { _wake.SafeWaitHandle.DangerousGetHandle() };
+            while (!_quit)
+            {
+                while (PeekMessage(out MSG msg, IntPtr.Zero, 0, 0, PM_REMOVE))
+                {
+                    if (msg.message == WM_QUIT) return;
+                    TranslateMessage(ref msg);
+                    DispatchMessage(ref msg);
+                }
+                if (!_visible)
+                {
+                    if (_shown)
+                    {
+                        ShowWindow(_hwnd, SW_HIDE);
+                        _shown = false;
+                        FreeBuffers();
+                    }
+                    MsgWaitForMultipleObjects(1, handles, false, 500, QS_ALLINPUT);
+                    continue;
+                }
+                long t0 = Stopwatch.GetTimestamp();
+                try { RenderFrame(); }
+                catch (Exception ex)
+                {
+                    Log.Error("Render", ex);
+                    _visible = false;
+                }
+                // Wait for the next composition (vsync). If DWM returns at once (it can,
+                // e.g. while the display sleeps), fall back to ~120 fps.
+                DwmFlush();
+                if (Stopwatch.GetElapsedTime(t0).TotalMilliseconds < 4) Thread.Sleep(4);
+            }
+        }
+        catch (Exception ex) { Log.Error("Lens thread", ex); }
+        finally
+        {
+            FreeBuffers();
+            if (_hwnd != IntPtr.Zero) DestroyWindow(_hwnd);
+        }
+    }
+
+    private void CreateWindow()
+    {
+        _wndProc = (h, m, w, l) => m == WM_NCHITTEST ? new IntPtr(HTTRANSPARENT) : DefWindowProc(h, m, w, l);
+        var wc = new WNDCLASSEX
+        {
+            cbSize = Marshal.SizeOf<WNDCLASSEX>(),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc),
+            hInstance = GetModuleHandle(null),
+            lpszClassName = "MagniGlassLens",
+        };
+        RegisterClassEx(ref wc);
+        _hwnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            "MagniGlassLens", "MagniGlass", WS_POPUP, 0, 0, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        if (_hwnd == IntPtr.Zero) throw new InvalidOperationException("CreateWindowEx failed: " + Marshal.GetLastWin32Error());
+        // Windows 10 2004+: keep the glass out of every screen capture, ours included. Then we
+        // can capture with CAPTUREBLT (which also sees other layered windows such as menus and
+        // tooltips). Older systems: plain BitBlt already leaves layered windows out.
+        _excluded = SetWindowDisplayAffinity(_hwnd, WDA_EXCLUDEFROMCAPTURE);
+        Log.Info($"Lens window ready, excluded from capture: {_excluded}");
+    }
+
+    private void RenderFrame()
+    {
+        GetCursorPos(out POINT pt);
+        Settings s = _settings;
+
+        IntPtr monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        GetMonitorInfo(monitor, ref mi);
+        if (GetDpiForMonitor(monitor, 0, out uint dpi, out _) != 0) dpi = 96;
+        int diameter = s.DiameterFor(mi.rcMonitor.Right - mi.rcMonitor.Left, mi.rcMonitor.Bottom - mi.rcMonitor.Top, dpi);
+
+        bool rebuilt = false;
+        if (_lens == null || _settingsChanged || _lens.Diameter != diameter || _lens.Flags != s.LensFlags)
+        {
+            _settingsChanged = false;
+            FreeBuffers();
+            _lens = new LensCore(diameter, _zoom, s.LensFlags);
+            _frame = new Dib(_lens.Width, _lens.Height);
+            _lens.DrawStatic(_frame.Bits, _frame.Width * 4);
+            rebuilt = true;
+        }
+        LensCore lens = _lens;
+        Dib frame = _frame!;
+        lens.SetZoom(_zoom);
+
+        int radius = lens.SourceRadius;
+        int size = 2 * radius + 1;
+        if (_source == null || size > _sourceSize)
+        {
+            _source?.Dispose();
+            _sourceSize = size + 16;
+            _source = new Dib(_sourceSize, _sourceSize);
+        }
+
+        IntPtr screen = GetDC(IntPtr.Zero);
+        try
+        {
+            BitBlt(_source.Dc, 0, 0, size, size, screen, pt.X - radius, pt.Y - radius, SRCCOPY | (_excluded ? CAPTUREBLT : 0));
+            GdiFlush();
+            lens.DrawGlass(_source.Bits, size, size, _sourceSize * 4, radius, radius, frame.Bits, frame.Width * 4);
+
+            var dst = new POINT(pt.X - lens.CenterX, pt.Y - lens.CenterY);
+            var sz = new SIZE(frame.Width, frame.Height);
+            var src = new POINT(0, 0);
+            var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
+            UpdateLayeredWindow(_hwnd, screen, ref dst, ref sz, frame.Dc, ref src, 0, ref blend, ULW_ALPHA);
+        }
+        finally { ReleaseDC(IntPtr.Zero, screen); }
+
+        long now = Environment.TickCount64;
+        if (!_shown || rebuilt || now - _lastTopmost > 500)
+        {
+            // Stay above other topmost windows (the taskbar, Start, other tools).
+            SetWindowPos(_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            _lastTopmost = now;
+        }
+        if (!_shown)
+        {
+            ShowWindow(_hwnd, SW_SHOWNOACTIVATE);
+            _shown = true;
+        }
+    }
+
+    private void FreeBuffers()
+    {
+        _lens?.Dispose();
+        _lens = null;
+        _frame?.Dispose();
+        _frame = null;
+        _source?.Dispose();
+        _source = null;
+        _sourceSize = 0;
+    }
+
+    public void Dispose()
+    {
+        _quit = true;
+        _wake.Set();
+        _thread.Join(1000);
+    }
+}
